@@ -1,7 +1,5 @@
 # Case Study Template — Agent Governance in Enterprise Environment
 
-**Length**: 2,000 to 3,000 words
-
 ## Case Study Metadata
 
 **Title**: [Industry-specific, descriptive title]
