@@ -1,5 +1,6 @@
 # GDPR-Compliant Customer Service Agents at VelvetCart Commerce
-_Note: This document presents a hypothetical use case intended to guide architecture and compliance planning. No real-world company data or metrics are included._
+_Disclaimer: This document presents a hypothetical use case intended to guide architecture and compliance planning. No real-world company data or metrics are included. This case study references AGT version 3.0.2. Component names and capabilities may differ in newer versions. Refer to the current documentation for the latest features. AGT is a tool to assist with compliance but does not guarantee compliance. Compliance depends on proper implementation and operational practices._
+**AGT Version**: 3.0.2
 
 ## Case Study Metadata
 
@@ -200,6 +201,8 @@ Post-pilot analysis revealed: shared identity preventing accountability, unrestr
         └─────────────────────────────────────────────────────┘
 ```
 
+*Figure 1: VCC's customer service agent architecture. Inbound tickets from six channels (chat, email, Twitter/X, Instagram, SMS, phone) funnel through Zendesk into the AGT governance layer, which acts as a firewall between agents and customer data. Agent OS (<0.06ms policy evaluation), AgentMesh (Ed25519 identity, per-agent DID, trust decay), and Agent Runtime (Ring 0–2 execution sandboxes on GCP) intercept every action before it reaches the eight agents. Monitoring agents (sentiment-analysis, fraud-detection) observe all traffic in parallel; specialist agents (order-status, returns-and-refund, product-question) handle resolution. All agent actions flow to e-commerce platform integrations (Shopify, Stripe, shipping carriers) with GDPR deletion required to cover all downstream data stores. Merkle-chained audit logs stream to GCP WORM storage with 6-year retention per GDPR Article 30.*
+
 YAML policies are stored in a version-controlled GitHub repository with mandatory 2-person review, evaluated at 0.05–0.06ms latency before every agent action. AgentMesh provides Ed25519 cryptographic identity per agent stored in GCP Secret Manager with Cloud HSM protection. Trust scores adjust dynamically based on CSAT, policy compliance, and business outcomes. Agent Runtime executes each agent in dedicated GCP Cloud Run containers with ring-based resource limits. Agent Compliance generates Merkle-chained append-only audit trails streamed to GCP Cloud Storage in WORM mode with 6-year retention.
 
 ### 3.3 Inter-Agent Communication and Governance
@@ -209,6 +212,70 @@ YAML policies are stored in a version-controlled GitHub repository with mandator
 **GDPR Deletion Workflow**: The gdpr-compliance-agent scans 11 systems, checks for active orders and legal retention requirements, generates a deletion plan, and routes to human privacy team for cryptographic approval. Agent OS blocks execution without human signature. During 12 months, 127 GDPR requests were processed with 100% compliance and zero order fulfillment failures.
 
 **Fraud Ring Detection**: The fraud-detection-agent maintains a graph database linking customers by shared addresses, payment methods, and return patterns. In Month 8, it detected 5 coordinated wardrobing returns in Boston — individual risk scores were low (0.15–0.25), but graph analysis showed 0.87 fraud probability. All 5 refunds were blocked, preventing $1,900 in losses.
+
+### 3.4 Agent Runtime Sandboxing
+
+VCC deploys all 8 agents on Google Kubernetes Engine (GKE) in us-central1, running on Container-Optimized OS (COS). The 90-second response SLA is the most lenient of the three case studies, which enables a meaningful Layer 3 isolation choice: gVisor is deployed for Ring 2 agents where the ~10μs/syscall overhead is acceptable, while Ring 1 agents use standard runc for lower latency.
+
+#### Execution Isolation Primitives
+
+| Mechanism | Layer | What It Enforces | Escape Risk Mitigated |
+|-----------|-------|------------------|-----------------------|
+| **Linux cgroups v2** | OS kernel | GKE resource limits per pod by ring: Ring 1 → 1.0 vCPU / 1 GiB; Ring 2 → 0.5 vCPU / 512 MiB | Runaway sentiment-analysis-agent (processing viral spikes) starving gdpr-compliance-agent during an active deletion workflow |
+| **Linux namespaces** (PID, network, mount, IPC) | OS kernel | Each pod has an isolated network stack; Ring 2 agents have no route to Shopify payment or refund APIs | product-question-agent or order-status-agent reaching payment endpoints they are explicitly denied under PCI-DSS Req. 7 |
+| **seccomp-BPF** | OS kernel | GKE default seccomp profile + VCC extensions blocking `ptrace`, `process_vm_readv`, and raw socket creation | Exploiting a kernel syscall to read another agent's in-memory customer PII or Shopify session tokens |
+| **AppArmor** | OS mandatory access control | Container-Optimized OS default AppArmor profile restricts filesystem paths and mount operations | Defense-in-depth if the seccomp profile is bypassed; prevents host filesystem path traversal |
+| **gVisor (`runsc`) — GKE Sandbox** | User-space kernel | Deployed for Ring 2 agents (order-status-agent, product-question-agent): user-space kernel intercepts all syscalls; host kernel never directly exposed | Kernel-level container escape in lower-trust agents handling untrusted customer-supplied product queries; 90-second SLA absorbs the ~10μs overhead |
+
+#### Privilege Ring → Resource Limit Mapping
+
+| Agent | Ring | Trust Score | vCPU | Memory | Network Access | Runtime |
+|-------|------|-------------|------|--------|----------------|---------|
+| gdpr-compliance-agent | Ring 1 | 860 | 1.0 | 1 GiB | GCP Secret Manager, internal deletion APIs only | runc |
+| fraud-detection-agent | Ring 1 | 840 | 1.0 | 1 GiB | Shopify order/account metadata (read-only) | runc |
+| inquiry-routing-agent | Ring 1 | 830 | 1.0 | 1 GiB | Zendesk ticket API (read/write) | runc |
+| sentiment-analysis-agent | Ring 1 | 810 | 1.0 | 1 GiB | Social media monitoring feeds (read-only) | runc |
+| escalation-coordinator-agent | Ring 1 | 800 | 1.0 | 1 GiB | Zendesk escalation queues | runc |
+| returns-and-refund-agent | Ring 1 | 720 | 1.0 | 1 GiB | Shopify refund API (write, capped at $200) | runc |
+| product-question-agent | Ring 2 | 790 | 0.5 | 512 MiB | Vector DB (catalog/FAQs) — no customer data endpoints | gVisor |
+| order-status-agent | Ring 2 | 760 | 0.5 | 512 MiB | Shopify shipping read + carrier tracking APIs | gVisor |
+
+`AgentRateLimiter`: Ring 1 → 1,000 calls/min; Ring 2 → 100 calls/min. Trust decay below 700 triggers mandatory human oversight mode — returns-and-refund-agent (trust 720) is monitored closest to this threshold.
+
+#### VFS Namespace Isolation
+
+Each agent's session context and customer data extracts are scoped to a per-DID `SessionVFS` namespace:
+- gdpr-compliance-agent's deletion plan (listing all 11 systems and legal retention exceptions) cannot be read or modified by any other agent — this prevents a compromised inquiry-routing-agent from interfering with a live GDPR workflow
+- returns-and-refund-agent cannot read fraud-detection-agent's risk scores before they are explicitly communicated via IATP — preventing an agent from gaming its own fraud assessment
+- All agents use **Snapshot isolation**: at 45K tickets/day with independent per-customer sessions, Serializable isolation overhead is unnecessary
+
+#### Breach Detection and Emergency Response
+
+- **`RingBreachDetector`**: WARNING (1-ring gap, e.g., order-status-agent attempting a Ring 1 refund API call), HIGH (2-ring gap), CRITICAL (3-ring gap). HIGH and CRITICAL trigger automatic kill
+- **`KillSwitch`**: automatic triggers for `RING_BREACH` (HIGH/CRITICAL), `RATE_LIMIT`, and `BEHAVIORAL_DRIFT`. **GDPR deferral exception**: if gdpr-compliance-agent holds an active Article 17 deletion in progress (deletion plan approved, execution underway), kill is deferred up to 120 seconds — a mid-execution kill would leave customer data partially erased across 11 systems with no saga compensation path, creating a GDPR Article 17 violation worse than the breach itself. The deletion completes, then the agent is terminated and the privacy team is notified.
+- **`QuarantineManager`**: preferred response for returns-and-refund-agent anomalies (trust 720, closest to the 700 human-oversight threshold) — isolates the agent while in-flight refund sagas are handed to human reviewers
+
+#### Defense-in-Depth Composition
+
+```
+Layer 1 — Application (AGT)
+  Agent OS: capability allow/deny, ring enforcement, <0.06ms latency
+  CapabilityGuardMiddleware: blocks Ring 2 agents from payment and refund APIs
+  SessionVFS: per-agent customer data namespace, Snapshot isolation
+
+Layer 2 — OS Kernel (GKE, Container-Optimized OS)
+  cgroups v2: Ring 1 → 1.0 vCPU / 1 GiB; Ring 2 → 0.5 vCPU / 512 MiB
+  Linux namespaces: PID, network, mount, IPC — Ring 2 agents have no route to payment endpoints
+  seccomp-BPF: GKE default profile + VCC extensions (blocks ptrace, raw sockets)
+  AppArmor: COS default profile restricts filesystem and mount operations
+
+Layer 3 — Hypervisor (GKE Sandbox — gVisor)
+  Deployed for Ring 2 agents (order-status-agent, product-question-agent)
+  Host kernel never directly exposed for lower-trust workloads handling customer queries
+  Ring 1 agents use standard runc; 90-second SLA makes gVisor overhead acceptable for Ring 2
+```
+
+A policy bypass at Layer 1 for a Ring 2 agent is contained by network namespace isolation at Layer 2 (no route to payment APIs) and by gVisor at Layer 3 (host kernel unreachable). Ring 1 agents rely on Layers 1 and 2; the threat model accepts that Ring 1 agents are sufficiently trusted that gVisor's overhead is not justified.
 
 ---
 
@@ -233,6 +300,20 @@ Additional security measures include AI-BOM tracking LLM model provenance and tr
 
 ### 4.2 Key Governance Policies
 
+  This section details the mission-critical governance policies that prevented 3,847 violations worth $142K+ in potential exposure over 12 months of
+  production operation. The policies below represent the minimum viable governance layer required to safely deploy autonomous agents in e-commerce
+  environments under GDPR and PCI-DSS. Each policy maps to specific regulatory requirements, demonstrates sub-millisecond enforcement
+  latency, and includes real production examples showing AGT controls in action.
+
+  **Most Critical Policies at a Glance:**
+
+  | Policy Name | Regulatory Driver | Prevented Risk | Impact |
+  |-------------|-------------------|----------------|--------|
+  | Viral Social Media Escalation | GDPR Art. 5(1)(f), brand risk management | Reputational damage and negative viral events | 23 interventions over 12 months, 100% success rate, 0 negative viral incidents |
+  | Refund Fraud Ring Detection | PCI-DSS Req. 6.4 | Coordinated refund fraud and wardrobing | Blocked 628 fraud patterns (347 individual, 281 rings), prevented $142K in losses |
+  | GDPR Deletion with Order-Safety Checks | GDPR Art. 17 (right to erasure) | Incomplete deletion causing DPC complaints and order fulfillment failures | 127 requests processed, 100% compliance, zero regulatory complaints |
+  | GDPR Data Minimization | GDPR Art. 5(1)(c) | Unauthorized PII access by agents outside their permitted scope | Blocked 892 data minimization violations, €0 in GDPR fines |
+
 **Viral Social Media Escalation**: Combines sentiment analysis with social media context. When high-anger keywords and influencer indicators are detected, normal routing is overridden for VIP escalation. During 12 months, 23 viral-risk interventions achieved 100% success rate preventing negative viral events, with 2.3% false positive rate.
 
 **Refund Fraud Ring Detection**: Graph-based detection linking customers by shared addresses, payment methods, IP ranges, and timing patterns. Catches coordinated abuse that individual transaction analysis misses. Detected 628 fraud patterns (347 individual abusers, 281 rings), preventing $142K in losses.
@@ -250,6 +331,41 @@ Additional security measures include AI-BOM tracking LLM model provenance and tr
 **PCI-DSS Requirement 7**: Policy engine intercepts Stripe API calls, filtering responses to remove full PANs — agents see only last 4 digits and card brand. QSA audit confirmed zero vulnerabilities.
 
 **Governance Reporting**: Weekly auto-generated reports covering ticket volume by agent, compliance rates (99.97% over 12 months), trust score distributions, escalation rates, and OWASP ASI posture. Delivered to CPO, VP Customer Experience, and available to regulators.
+
+### 4.4 Cryptographic Controls and Key Management
+
+This section documents cryptographic operations, key management practices, and verification mechanisms implemented to address OWASP ASI-03 (Identity & Privilege Abuse) and ASI-07 (Insecure Inter-Agent Communication) in VCC's GDPR- and PCI-DSS-regulated customer service environment.
+
+#### 4.4.1 Cryptographic Operations
+
+| Operation | Algorithm | What Is Signed | Verification Point |
+|-----------|-----------|----------------|--------------------|
+| Agent identity signing | Ed25519 | `{agentDID, actionType, resourceURI, timestamp_ms, policyDecision}` | AgentMesh DID registry; Zendesk, Shopify, and Stripe API calls include signed JWT validated against DID registry on every request |
+| IATP trust attestation | Ed25519 | `{delegatorDID, delegateeDID, capabilitySet, effectiveTrustScore, issuedAt, expiresAt, nonce}` | Receiving agent verifies signature against delegator's public key in DID registry before accepting task delegation |
+| Inter-agent message integrity | Ed25519 + SHA-256 | Full message payload signed at each delegation hop | Each downstream agent re-verifies; monotonic capability narrowing enforced on capability set at each hop |
+| GDPR deletion approval | Ed25519 (human-signed) | `{deletionPlanID, agentDID, affectedSystems[], retentionExceptions[], approverID, timestamp_ms}` | gdpr-compliance-agent verifies human approver's Ed25519 signature before executing any erasure action across 11 systems; Agent OS blocks execution without valid signature |
+| Audit trail integrity | SHA-256 Merkle chain | Each log entry: `{prev_hash, agentDID, timestamp_ms, actionType, pseudonymizedCustomerID, dataCategory, legalBasis, policyDecision}` | Hash chains verified in GCP Cloud Storage WORM mode; DPC audit confirmed 100% integrity across 2.7M interactions |
+| Transport | TLS 1.3 (mTLS) | N/A — channel-level encryption | Mutual certificate validation on all Zendesk, Shopify, and Stripe API connections and inter-agent channels; required cipher suites: TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256 |
+| PII at rest | AES-256-GCM | Customer PII, cardholder data, ticket content | GCP Cloud HSM-managed keys scoped per agent; PCI-DSS Requirement 3 compliance; agents outside PCI scope never receive decrypted PANs |
+
+#### 4.4.2 Key Management Practices
+
+- **Key generation**: Ed25519 keypairs generated inside GCP Cloud HSM (FIPS 140-2 Level 2) at agent provisioning time. Private keys never leave the HSM — all signing operations execute within Cloud HSM via GCP Secret Manager API. Entropy source: hardware RNG within GCP Cloud HSM.
+- **Key storage**: GCP Secret Manager with per-agent service accounts. Each agent's secret has an IAM binding scoped exclusively to that agent's service account — no shared credentials, no cross-agent access. Separation of duty enforced: Secret Manager administrators cannot access secret values; agents cannot modify their own IAM bindings. All secret access logged to GCP Cloud Audit Logs for GDPR Article 30 and PCI-DSS Requirement 10 compliance.
+- **Key rotation**: Ed25519 identity keys rotate every 90 days via automated GCP Secret Manager rotation policy. On rotation, AgentMesh publishes the updated public key to the DID registry. In-flight Shopify and Stripe API calls complete under the prior key (short JWT expiry ensures natural cutover); new requests use tokens signed with the new key. Zero downtime — no agent restart or customer ticket interruption required.
+- **Key revocation**: Triggers: (a) trust score drops below 600 following fraud pattern detection or GDPR policy violations, (b) gdpr-compliance-agent attempts to bypass human approval signature — immediately activates kill switch, (c) Agent SRE detects anomalous behavior (e.g., returns-and-refund-agent issuing refunds beyond $200 cap), (d) manual security incident declaration. On trigger: GCP Secret Manager disables the secret version within <2 seconds; AgentMesh marks DID `deactivated`; all active IATP sessions from the revoked agent invalidated within one heartbeat cycle (5 seconds). In-flight customer tickets are routed to the human escalation queue — no customer request is silently dropped.
+- **DID lifecycle**:
+  - *Creation*: On agent provisioning — Cloud HSM generates keypair, AgentMesh registers `did:agentmesh:{agentId}:{fingerprint}` with public key, privilege ring, and initial trust score.
+  - *Update*: On 90-day key rotation (new public key) or ring change (trust score threshold crossed, e.g., fraud-detection-agent trust decay). DID document version incremented; prior versions retained for GDPR Article 30 audit integrity.
+  - *Deactivation*: On agent decommission or revocation. DID marked `deactivated` — not deleted. Historical signatures remain verifiable for the 6-year GDPR Article 30 retention period.
+
+#### 4.4.3 Verification Mechanisms
+
+- **Peer identity verification before inter-agent calls**: Before accepting any IATP delegation, the receiving agent: (1) resolves the delegating agent's DID from AgentMesh registry, (2) checks status — rejects immediately if `deactivated`, (3) verifies the Ed25519 signature on the attestation payload, (4) confirms the effective trust score meets the minimum threshold for the requested capability. Total verification overhead: <1ms per call — negligible against the 90-second customer response SLA.
+- **Trust score threshold at connection time**: Agents with trust score below 600 cannot initiate delegations for financial or privacy-sensitive actions (refund issuance, GDPR data access, customer PII retrieval). Agents scoring 600–699 may delegate only to human escalation queues, not to peer agents. Agents at 700+ may delegate within their approved capability set. The returns-and-refund-agent (trust 720) and gdpr-compliance-agent (trust 860) are specifically monitored — any trust decay below 700 for either triggers mandatory human oversight for all subsequent actions.
+- **Replay attack prevention**: All IATP attestations include a cryptographically random 128-bit nonce and an `issuedAt` timestamp (millisecond precision, NTP-synchronized). Receiving agents maintain a nonce cache (10-minute TTL) and reject any attestation with a previously seen nonce or timestamp outside a ±60-second window. This is especially critical for GDPR deletion workflows: a replayed human approval signature could trigger duplicate erasure of a customer's data across all 11 systems (Shopify, Stripe, SendGrid, Klaviyo, Segment, and others) while orders are still in transit — exactly the failure mode that triggered VCC's original DPC complaint.
+- **Delegation chain verification**: For the GDPR deletion workflow (gdpr-compliance-agent → human approver → execution across 11 systems), the agent verifies the full chain before executing any erasure: each Ed25519 signature including the human approver's, active order and legal hold checks completed, monotonic capability narrowing at each hop, and no deactivated DID in the chain. For the viral escalation workflow (sentiment-analysis-agent → escalation-coordinator-agent → human VIP queue), the same chain verification applies. Maximum chain depth: 4 hops (Agent OS policy).
+- **Failure behavior**: When verification fails (invalid signature, deactivated DID, expired nonce, trust below threshold), the agent: (1) denies the action immediately and logs full chain details with timestamp to the Merkle audit trail (satisfying GDPR Article 30 documentation requirements), (2) never silently fails — customer requests are always routed to a human queue rather than dropped, (3) for GDPR deletion failures, immediately notifies the privacy team with the failure reason to preserve the 30-day GDPR response window, (4) if 3+ failures from the same agent occur within 10 minutes, alerts VCC security operations and initiates trust decay on the suspicious agent.
 
 ---
 

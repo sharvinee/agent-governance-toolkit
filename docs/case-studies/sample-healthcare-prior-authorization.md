@@ -1,5 +1,5 @@
 # HIPAA-Compliant Prior Authorization Agents at Cascade Health Partners
-_Note: This document presents a hypothetical use case intended to guide architecture and compliance planning. No real-world company data or metrics are included._
+_Disclaimer: This document presents a hypothetical use case intended to guide architecture and compliance planning. No real-world company data or metrics are included. This case study references AGT version 3.0.2. Component names and capabilities may differ in newer versions. Refer to the current documentation for the latest features. AGT is a tool to assist with compliance but does not guarantee compliance. Compliance depends on proper implementation and operational practices._
 
 ## Case Study Metadata
 
@@ -202,6 +202,8 @@ The CMO's assessment was stark: "We nearly poisoned a cancer patient with nephro
         └──────────────────────────────────────────────────────┘
 ```
 
+*Figure 1: CHP's prior authorization agent architecture. Clinical and payer systems (Epic EHR, 47 payer APIs, clinical decision support) connect to the AGT governance layer via OAuth 2.0 + mTLS under a HIPAA Business Associate Agreement. Agent OS (<0.08ms policy evaluation) enforces clinical safety rules — PHI minimum necessary, drug-drug interaction checks, pediatric flags, and emergency fast-path routing — while AgentMesh provides Ed25519 cryptographic identity and trust decay tied to clinical errors (HIPAA §164.312(d)). Agent Runtime executes five agents across Ring 0–2 isolation tiers on Azure Container Instances. The sequential authorization workflow flows left to right: eligibility-verification-agent (Ring 1) → clinical-documentation-agent (Ring 2, denied psychiatric/substance abuse records) → authorization-decision-agent (Ring 1) → payer-submission-agent (Ring 1), with appeals-agent handling denials and clinical-safety-override-agent (Ring 0, trust 900) providing a sub-30-second emergency bypass. All PHI access is logged with agent DID and HMAC-anonymized patient ID to Azure Monitor WORM storage with 7-year retention per HIPAA §164.308.*
+
 AGT layers governance middleware between Microsoft Healthcare Bot and CHP's clinical systems. YAML policies evaluated at 0.06-0.08ms latency before every action intercept all Epic FHIR, payer API, and clinical decision support calls. AgentMesh provides Ed25519 cryptographic identity per agent (Azure Key Vault HSM-protected) with dynamic trust score adjustment—agents with three overturned denials decay from Ring 1 (trust 800) to Ring 2 (trust 600), reducing autonomous authority. Agent Runtime executes agents in Azure Container Instances with ring-based resource limits (Ring 1: 4 vCPUs/8GB, Ring 2: 2 vCPUs/4GB). Agent Compliance generates Merkle-chained audit logs (agent DID, timestamp, action type, HMAC-anonymized patient ID, policy decision) streamed to Azure Monitor WORM storage with 7-year retention. Epic integration uses HL7 FHIR R4 with scoped OAuth 2.0 credentials per agent. Payer integration abstracts 47 different protocols (SOAP, REST, FHIR) while maintaining capability isolation.
 
 ### 3.3 Inter-Agent Communication and Governance
@@ -213,6 +215,77 @@ CHP's authorization workflow implements delegation patterns designed for healthc
 **Acute Stroke Thrombectomy (22 seconds)** — At 2:51 AM, a 67-year-old woman arrives with acute stroke (right-sided weakness, aphasia). ED physician submits emergency authorization for mechanical thrombectomy (CPT 61645, $42,000). Eligibility-verification-agent (3s): detects emergency indicators (ED source, stroke diagnosis I63.32, STAT flag, after-hours) → Agent OS emergency policy activates, bypasses standard workflow, routes to clinical-safety-override-agent (Ring 0, trust 900). Safety verification (5s): confirms Medicare coverage, in-network provider, no contraindications. Issues PROVISIONAL EMERGENCY AUTHORIZATION. Payer notification (9s): Medicare auto-approves ER-MEDICARE-849203. Total: 22 seconds. Patient proceeds to thrombectomy, door-to-puncture 58 minutes. Retrospective review next morning confirms medical necessity. Result: NIHSS improved from 18 (severe) to 4 (mild), patient discharged to rehab with mild residual deficits, expected independent living. Emergency fast-path prevented 15-20 minute delay that could have caused permanent severe disability.
 
 **Medicare Part D vs Commercial Formulary** — Same drug (Humira biosimilar, $6,400/month), different timelines. Medicare Part D (72-year-old, SilverScript): authorization-decision-agent finds step therapy met (methotrexate, sulfasalazine trials documented) but prescribed dose (4 syringes/month) exceeds formulary limit (2 syringes/28 days). Appeals-agent requests medical exception, drafts letter citing clinical literature, submits to SilverScript. Medicare Part D regulatory timeline: 14 business days for exception review. Total: 18 days. Commercial Insurance (34-year-old, UnitedHealthcare): agent queries formulary (Tier 3, no quantity limits), confirms step therapy met, submits to UHC API → AUTO-APPROVED in 4.2 seconds. Total: 6 minutes. Medicare Part D has complex federal regulations (step therapy, quantity limits, exception pathways). Commercial insurance offers algorithmic auto-approval. Payer-submission-agent abstracts this complexity, navigating 47 different payer formularies so physicians submit one request.
+
+### 3.4 Agent Runtime Sandboxing
+
+CHP deploys all 12 agents as dedicated Azure Container Instances in two Azure regions (East US, West US 2), with each container running exactly one agent process. PHI sensitivity and HIPAA §164.312(a)(2)(i) unique user/system identification requirements make OS-level isolation non-negotiable: a single misconfigured agent must not be able to read another agent's FHIR API response cache or access psychiatric records it was never authorized to touch. Three overlapping isolation layers enforce this at runtime.
+
+#### Execution Isolation Primitives
+
+| Mechanism | Layer | What It Enforces at CHP | Escape Risk Mitigated | HIPAA / Regulatory Driver |
+|-----------|-------|-------------------------|-----------------------|---------------------------|
+| **Linux cgroups v2** | OS kernel | Ring-keyed resource quotas enforced by Azure Container Instances: Ring 3 → 0.25 vCPU / 256 MiB; Ring 2 → 0.5 vCPU / 512 MiB; Ring 1 → 1.0 vCPU / 1 GiB; Ring 0 → 2.0 vCPU / 2 GiB | Runaway agent consuming host resources, starving emergency authorization path | HIPAA §164.308(a)(7) — contingency plan requires system availability; resource exhaustion is a DoS against emergency care |
+| **Linux namespaces** (PID, network, mount, IPC, UTS) | OS kernel | Each container has an isolated PID tree and network stack; no cross-container process visibility; mount namespace prevents agents from accessing each other's ephemeral FHIR data volumes | Lateral movement: clinical-documentation-agent reading eligibility-verification-agent's in-memory patient demographics cache | HIPAA §164.514(d) minimum necessary — network isolation ensures agents can only reach their authorized API endpoints |
+| **seccomp-BPF profiles** | OS kernel | Allowlisted syscall set blocks `ptrace`, `reboot`, raw socket creation, `open_by_handle_at`, and namespace-manipulation calls; agents cannot inspect or signal sibling containers | Container breakout via exploited syscall after a compromised agent process reaches userspace | HIPAA §164.312(c)(1) integrity — PHI must not be altered or destroyed; blocking raw sockets prevents exfiltration of PHI outside approved payer API channels |
+| **AppArmor profiles** (Azure-default) | OS mandatory access control | Per-container AppArmor policy restricts filesystem paths (agents can only write to `/tmp/agent-workspace`), denies `/proc/sysrq-trigger`, and blocks mount operations | Defense-in-depth if a seccomp profile gap is exploited; prevents filesystem path traversal to host-mounted Azure File Share volumes | HIPAA §164.312(a)(1) access control — mandatory access control enforces minimum necessary at the OS layer independent of application logic |
+| **gVisor / Kata Containers** | Hypervisor | **Not deployed at CHP** — Azure Container Instances' hypervisor-level isolation (Hyper-V per-container) provides equivalent kernel separation without the operational overhead of gVisor. Re-evaluated annually. | N/A at current deployment; host kernel isolation provided by ACI's Hyper-V boundary | FIPS 140-2 Level 2 HSM (Azure Key Vault) is the CHP compliance tier; Level 3 physical tamper-evidence not required |
+
+#### Privilege Ring → Resource Limit Mapping
+
+Each of CHP's named agents is assigned a ring based on its effective trust score. Azure Container Instances enforces the corresponding cgroup limits at container startup; limits cannot be changed at runtime without re-deploying the container with a new SRE-signed manifest.
+
+| Agent | Ring | Trust Score | vCPU | Memory | Network Egress | Syscall Scope |
+|-------|------|-------------|------|--------|----------------|---------------|
+| clinical-safety-override-agent | Ring 0 | 900 | 2.0 | 2 GiB | Unrestricted (Medicare emergency endpoints) | All (SRE Witness attestation required to start) |
+| eligibility-verification-agent | Ring 1 | 820 | 1.0 | 1 GiB | Allowlisted payer eligibility APIs (47 endpoints) | No raw sockets; no `execve` of external binaries |
+| payer-submission-agent | Ring 1 | 800 | 1.0 | 1 GiB | Allowlisted payer authorization APIs (47 endpoints) | No raw sockets; no `execve` of external binaries |
+| appeals-agent | Ring 1 | 780 | 1.0 | 1 GiB | Allowlisted payer appeals APIs + physician review portal | No raw sockets; no `execve` of external binaries |
+| authorization-decision-agent | Ring 1 | 750 | 1.0 | 1 GiB | Read-only to Micromedex + MCG/InterQual endpoints | No raw sockets; no writes to Epic EHR |
+| clinical-documentation-agent | Ring 2 | 650 | 0.5 | 512 MiB | Epic FHIR R4 read endpoints only; no payer APIs | No writes to Epic; `ptrace` blocked; no socket creation outside allowlist |
+
+`AgentRateLimiter` enforces call quotas on top of cgroup limits: Ring 1 agents → 1,000 calls/min; Ring 2 → 100 calls/min. The emergency authorization fast-path bypasses the Ring 2 rate limit for clinical-safety-override-agent (Ring 0) only — all other agents remain rate-limited during emergency events.
+
+#### VFS Namespace Isolation
+
+Each agent runs with a dedicated ephemeral volume (`/tmp/agent-workspace`) backed by Azure Container Instances' local SSD. Agent Runtime's `SessionVFS` adds a second application-layer isolation boundary within shared authorization sessions:
+
+- **Cross-agent PHI access blocked**: clinical-documentation-agent cannot read eligibility-verification-agent's in-session FHIR response cache, even when both participate in the same authorization workflow. This enforces HIPAA minimum necessary at the application layer independently of OS namespace isolation.
+- **Scoped deletes**: an agent can only delete files it wrote within its own DID namespace. Eligibility data written by eligibility-verification-agent cannot be cleared by clinical-documentation-agent, preventing tampering with the factual basis for an authorization decision.
+- **Serializable isolation for emergency path**: the emergency authorization workflow (clinical-safety-override-agent) uses `IsolationLevel.SERIALIZABLE` with intent locks and vector clocks. This prevents race conditions where a standard-path denial could conflict with a Ring 0 emergency approval for the same patient record — the intent lock ensures the emergency approval wins and is recorded without ambiguity in the Merkle audit trail.
+- **Standard authorizations use Snapshot isolation**: lower coordination overhead for the 2,400/day routine volume; concurrent writes are allowed since routine authorizations for different patients do not share state.
+
+#### Breach Detection and Emergency Response
+
+CHP's sandboxing violation pipeline is designed around one constraint: **a breach response must never delay an active emergency authorization**. The kill switch configuration reflects this explicitly:
+
+- **`RingBreachDetector`**: fires on ring boundary violations — WARNING (1-ring gap, e.g., clinical-documentation-agent attempting a Ring 1 write), HIGH (2-ring gap), CRITICAL (3-ring gap, e.g., Ring 2 agent attempting Ring 0 emergency override). CRITICAL breaches page the on-call clinical informatics engineer within 30 seconds via Azure Monitor alert.
+- **`KillSwitch`** automatic triggers: `RING_BREACH` (severity HIGH or CRITICAL), `RATE_LIMIT` (after three consecutive violations within 60 seconds), `BEHAVIORAL_DRIFT` (agent approving treatments with active contraindications flagged by Micromedex). **Exception**: kill switch execution is deferred by up to 90 seconds if the breaching agent holds an active PROVISIONAL EMERGENCY AUTHORIZATION — the emergency authorization is completed and handed off first, then the agent is terminated and the incident escalated to clinical informatics.
+- **`QuarantineManager`**: used for WARNING-severity breaches (e.g., Ring 2 agent reading a record type outside its normal scope). Agent is isolated; the authorization case it was processing is handed to a human reviewer; in-flight saga state is preserved for forensic review. Quarantine is the preferred response for clinical-documentation-agent anomalies because termination mid-workflow would leave an authorization in an incomplete state with no saga compensation possible against Epic EHR.
+- **`AgentRateLimiter`**: a sudden spike in PHI read calls from clinical-documentation-agent (e.g., >500 Epic API calls in 60 seconds vs. normal 80–120) triggers a `RATE_LIMIT` kill reason. This pattern matches the Week 6 psychiatric records incident — bulk PHI access outside authorization scope.
+
+#### Defense-in-Depth Composition
+
+```
+Layer 1 — Application (AGT)
+  Agent OS policy engine: capability allow/deny, ring enforcement, <0.08ms average latency
+  CapabilityGuardMiddleware: blocks Epic bulk export API, psychiatric record access for non-psychiatric agents
+  SessionVFS: per-agent FHIR data namespace; Serializable isolation on emergency path
+
+Layer 2 — OS Kernel (Azure Container Instances — Linux)
+  cgroups v2: CPU/memory quotas per ring, enforced at ACI container startup
+  Linux namespaces: PID, network, mount, IPC isolation — no cross-container PHI visibility
+  seccomp-BPF: blocks ptrace, raw sockets, namespace manipulation (custom CHP profile, reviewed quarterly)
+  AppArmor: per-container MAC policy restricts filesystem paths and mount operations (Azure-default profile + CHP extensions)
+
+Layer 3 — Hypervisor (Azure Container Instances — Hyper-V)
+  ACI Hyper-V per-container isolation: each container runs in a dedicated Hyper-V VM partition
+  Host kernel never directly exposed to agent processes; equivalent protection to gVisor without operational overhead
+  Reviewed annually; gVisor adoption to be re-evaluated if CHP deploys Ring 3 agents executing model-generated code
+```
+
+A policy bypass at Layer 1 is contained by namespace and seccomp isolation at Layer 2 — a clinical-documentation-agent that circumvents its capability deny list still cannot reach a payer API because its network namespace has no route to payer endpoints. A kernel exploit at Layer 2 is contained by Hyper-V isolation at Layer 3 — the host kernel is never directly reachable from within an agent container.
+
+CHP's AKS-based staging environment additionally enforces: `securityContext.runAsNonRoot: true`, `readOnlyRootFilesystem: true`, dropped Linux capabilities (`ALL` dropped, `NET_BIND_SERVICE` re-added only for payer-submission-agent), and `allowPrivilegeEscalation: false` on all agent pods.
 
 ---
 
@@ -235,6 +308,19 @@ CHP's authorization workflow implements delegation patterns designed for healthc
 
 ### 4.2 Key Governance Policies
 
+  This section details the mission-critical governance policies that prevented 1,247 violations worth $4M+ in potential exposure over 12 months of
+  production operation. The policies below represent the minimum viable governance layer required to safely deploy autonomous agents in healthcare
+  environments under HIPAA and clinical safety standards. Each policy maps to specific regulatory requirements, demonstrates sub-millisecond enforcement
+  latency, and includes real production examples showing AGT controls in action.
+
+  **Most Critical Policies at a Glance:**
+
+  | Policy Name | Regulatory Driver | Prevented Risk | Impact |
+  |-------------|-------------------|----------------|--------|
+  | Drug-Drug Interaction and Contraindication Checking | Joint Commission NPSG.03.06.01, HIPAA §164.308(a)(5) | Chemotherapy-related organ injury and patient harm | Flagged 131 chemo auths; 89 dose adjustments, 24 treatment plan changes; 0 chemo-related injuries |
+  | Emergency Surgery Fast-Path | EMTALA, CMS Conditions of Participation | Life-threatening delays in emergency care | 847 emergency auths processed in 12 months, avg 12-second processing, 97.2% confirmed appropriate |
+  | Pediatric Medication Dosing Verification | Joint Commission NPSG.03.06.01, CMS medication safety standards | Pediatric overdose and malpractice liability | Flagged 83 auths; 67 dosing discrepancies corrected (81% flag rate); prevented $4M+ malpractice exposure |
+
 **Drug-Drug Interaction and Contraindication Checking for Chemotherapy**
 
 Prevents pilot near-miss (carboplatin approved for renal-impaired patient). 
@@ -246,7 +332,7 @@ Policy activates: eGFR 32 mL/min (severe renal impairment).
 Policy halts: "Carboplatin nephrotoxic, requires Calvert formula dose reduction." Routes to oncology pharmacist who calculates 40% dose reduction, coordinates with oncologist, resubmits. 
 Outcome: Patient completed 4 cycles with renal-adjusted dosing, no acute kidney injury, eGFR stable. 
 Without intervention: likely acute kidney failure requiring dialysis. 
-12-month production: Policy flagged 127 chemotherapy authorizations (83 renal, 28 hepatic, 12 bone marrow, 4 drug interactions). 89 dose adjustments, 24 treatment plan changes, 14 confirmations safe with monitoring. Zero chemo-related acute kidney injuries or hepatotoxicity.
+12-month production: Policy flagged 131 chemotherapy authorizations (84 renal, 28 hepatic, 14 bone marrow, 5 drug interactions). 89 dose adjustments, 24 treatment plan changes, 14 confirmations safe with monitoring. Zero chemo-related acute kidney injuries or hepatotoxicity.
 
 **Emergency Surgery Fast-Path with Retrospective Review**
 
@@ -279,6 +365,40 @@ Without intervention: 2.5x recommended dose, likely severe sedation, respiratory
 **HIPAA §164.308(a)(1)(ii)(D) — Information System Activity Review** requires comprehensive audit logs of system access to PHI. Agent Compliance generates Merkle-chained audit trails: agent DID, timestamp (millisecond precision), action type, resource accessed (Epic FHIR + HMAC-anonymized patient ID), policy decision (allow/deny), denial reason. Logs immutable via cryptographic hash chains, 7-year retention in Azure Monitor WORM storage. Deloitte March 2025 audit: 100% coverage, zero tampering incidents, no gaps.
 
 **HIPAA §164.312(d) — Person or Entity Authentication** requires unique verifiable credentials per entity accessing PHI. AgentMesh provides Ed25519 cryptographic keypairs (Azure Key Vault HSM) generating unique DIDs (`did:agentmesh:{agentId}:{fingerprint}`). Every Epic FHIR call includes JWT bearer token signed with agent's private key, verified by Epic using public key from AgentMesh DID registry. Tokens expire 15 minutes, cannot be reused across agents. DID certificates retained indefinitely (revoked not deleted for audit integrity). Deloitte audit confirmed cryptographic non-repudiation meets regulatory requirements.
+
+### 4.4 Cryptographic Controls and Key Management
+
+This section documents cryptographic operations, key management practices, and verification mechanisms implemented to address OWASP ASI-03 (Identity & Privilege Abuse) and ASI-07 (Insecure Inter-Agent Communication) in CHP's HIPAA-regulated environment.
+
+#### 4.4.1 Cryptographic Operations
+
+| Operation | Algorithm | What Is Signed | Verification Point |
+|-----------|-----------|----------------|--------------------|
+| Agent identity signing | Ed25519 | `{agentDID, actionType, resourceURI, timestamp_ms, policyDecision}` | AgentMesh DID registry; Epic FHIR API validates JWT on every call |
+| IATP trust attestation | Ed25519 | `{delegatorDID, delegateeDID, capabilitySet, effectiveTrustScore, issuedAt, expiresAt, nonce}` | Receiving agent verifies signature against delegator's public key in DID registry before accepting delegation |
+| Inter-agent message integrity | Ed25519 + SHA-256 | Full message payload signed at each delegation hop | Each downstream agent re-verifies; monotonic capability narrowing enforced on capability set at each hop |
+| Audit trail integrity | SHA-256 Merkle chain | Each log entry: `{prev_hash, agentDID, timestamp_ms, actionType, HMAC(patientID), policyDecision}` | Hourly hash published to Azure Monitor immutable ledger; Deloitte verified chain integrity across 12 months with zero tampering |
+| Transport | TLS 1.3 (mTLS) | N/A — channel-level encryption | Mutual certificate validation on every Epic FHIR, payer API, and inter-agent connection; required cipher suites: TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256 |
+| PHI in inter-agent messages | AES-256-GCM | Patient data payloads within IATP messages | Decrypted only by intended recipient agent using scoped key from Azure Key Vault; satisfies HIPAA §164.312(e)(2)(ii) |
+
+#### 4.4.2 Key Management Practices
+
+- **Key generation**: Ed25519 keypairs generated inside Azure Key Vault FIPS 140-2 Level 2 HSM at agent provisioning time. Private keys never leave the HSM — all signing operations execute within Key Vault via REST API. Entropy source: hardware RNG within Azure HSM.
+- **Key storage**: Azure Key Vault Premium tier. Each agent has a dedicated vault secret with access policy scoped exclusively to that agent's managed identity — no shared service accounts. Separation of duty enforced: key administrators cannot use keys; key users cannot manage vault policies.
+- **Key rotation**: Ed25519 identity keys rotate every 90 days via automated Azure Key Vault rotation policy. On rotation, AgentMesh updates the agent's DID document with the new public key and publishes to the DID registry. In-flight Epic FHIR calls complete under the prior key (15-minute JWT expiry ensures natural cutover); new tokens are signed with the new key. Zero downtime — no agent restart required.
+- **Key revocation**: Triggers: (a) trust score drops below 500 following a clinical safety violation, (b) Agent SRE detects anomalous container behavior, (c) manual security incident declaration by CHP security operations. On trigger: Azure Key Vault revokes key within <2 seconds; AgentMesh marks DID `deactivated` in the registry; all active IATP sessions from the revoked agent are invalidated within one heartbeat cycle (5 seconds). Downstream agents receiving a delegation from a revoked DID reject it, log the attempt to the Merkle audit trail, and route the clinical request to the human escalation queue — ensuring patient care continues without interruption.
+- **DID lifecycle**:
+  - *Creation*: On agent provisioning — Key Vault generates keypair, AgentMesh registers `did:agentmesh:{agentId}:{fingerprint}` with public key, ring, and initial trust score.
+  - *Update*: On 90-day key rotation (new public key published) or ring change (trust score threshold crossed). DID document version incremented; prior versions retained for audit integrity.
+  - *Deactivation*: On agent decommission or revocation. DID marked `deactivated` — not deleted. Historical signatures remain verifiable for the 7-year HIPAA retention period per §164.312(d).
+
+#### 4.4.3 Verification Mechanisms
+
+- **Peer identity verification before inter-agent calls**: Before accepting any IATP delegation, the receiving agent: (1) resolves the delegating agent's DID from AgentMesh registry, (2) checks status — rejects immediately if `deactivated`, (3) verifies the Ed25519 signature on the attestation payload, (4) confirms the effective trust score meets the minimum threshold for the requested capability. Total verification overhead: <1ms per call.
+- **Trust score threshold at connection time**: Agents with trust score below 600 cannot initiate delegations for clinical decisions (chemotherapy approval, emergency fast-path override). Agents scoring 600–699 may delegate only to human escalation queues, not to peer agents. Agents at 700+ may delegate within their approved capability set. If a delegating agent's score falls below threshold between delegation and execution, the executing agent re-checks at execution time and escalates rather than proceeding.
+- **Replay attack prevention**: All IATP attestations include a cryptographically random 128-bit nonce and an `issuedAt` timestamp (millisecond precision, NTP-synchronized). Receiving agents maintain a nonce cache (5-minute TTL) and reject any attestation with a previously seen nonce or timestamp outside a ±30-second window. This is critical in healthcare: a replayed PROVISIONAL EMERGENCY AUTHORIZATION could authorize a duplicate surgical procedure, causing patient harm and fraudulent billing.
+- **Delegation chain verification**: For sequential workflows (eligibility-verification-agent → clinical-documentation-agent → authorization-decision-agent → payer-submission-agent), each agent receives the full attestation chain from the origin. Before accepting a delegation, the agent walks the chain from origin to immediate delegator, verifying: each Ed25519 signature, monotonic capability narrowing at each hop, and that no DID in the chain is deactivated. Maximum chain depth: 4 hops (enforced by Agent OS policy).
+- **Failure behavior**: When verification fails (invalid signature, deactivated DID, expired nonce, trust below threshold), the agent: (1) denies the action immediately and logs the full chain details to the Merkle audit trail, (2) never silently fails or defaults to approval — patient safety requires explicit human escalation, (3) routes the original clinical request to the human escalation queue with failure reason attached, (4) if 3+ failures from the same agent occur within 10 minutes, alerts CHP security operations and initiates trust decay on the suspicious agent.
 
 ---
 
