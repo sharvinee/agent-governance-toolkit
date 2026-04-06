@@ -98,7 +98,7 @@ The CMO's assessment was stark: "We nearly poisoned a cancer patient with nephro
 │  │  Medicare    │ Medicaid   │ UnitedHealthcare │ Anthem      │    │
 │  │  BCBS (12)   │ Aetna      │ Cigna            │ Humana      │    │
 │  │  Regional HMOs (22 plans) │ Workers' Comp (8 payers)       │    │
-│  │                                                            │   │
+│  │                                                            │    │
 │  │  Protocols: SOAP/WS-Security (legacy), REST (modern),      │    │
 │  │             HL7 FHIR (2 payers), proprietary XML (14)      │    │
 │  │                                                            │    │
@@ -145,11 +145,11 @@ The CMO's assessment was stark: "We nearly poisoned a cancer patient with nephro
         │  │   Ring 2: Standard  Ring 3: Untrusted              │ │
         │  │   [Container isolation by clinical risk level]     │ │
         │  └────────────────────────────────────────────────────┘ │
-        └────────────────────┬───────────────────────────────────┘
+        └────────────────────┬────────────────────────────────────┘
                              │
-        ┌────────────────────┴─────────────────────────────────┐
-        │                                                      │
-        ▼                  ▼                ▼                  ▼
+        ┌─────────────────┬──┴─────────────┬──────────────────┐
+        │                 │                │                  │
+        ▼                 ▼                ▼                  ▼
 ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
 │ Eligibility  │  │ Clinical     │  │ Auth         │  │ Payer        │
 │ Verification │  │ Documentation│  │ Decision     │  │ Submission   │
