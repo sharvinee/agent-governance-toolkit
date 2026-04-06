@@ -1,5 +1,10 @@
 # Case Study Template — Agent Governance in Enterprise Environment
 
+> **Purpose**: This template provides a standardized structure for documenting real-world implementations of the Agent Governance Toolkit across different industries. Each case study should demonstrate how AGT's governance capabilities address specific business challenges, regulatory requirements, and operational needs.
+
+> **Audience**: This template serves both executive decision-makers (business context, ROI, compliance) and technical implementers (architecture, policies, integration).
+
+
 ## Case Study Metadata
 
 **Title**: [Industry-specific, descriptive title]
