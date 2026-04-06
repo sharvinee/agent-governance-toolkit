@@ -263,6 +263,29 @@ CHP's sandboxing violation pipeline is designed around one constraint: **a breac
 - **`QuarantineManager`**: used for WARNING-severity breaches (e.g., Ring 2 agent reading a record type outside its normal scope). Agent is isolated; the authorization case it was processing is handed to a human reviewer; in-flight saga state is preserved for forensic review. Quarantine is the preferred response for clinical-documentation-agent anomalies because termination mid-workflow would leave an authorization in an incomplete state with no saga compensation possible against Epic EHR.
 - **`AgentRateLimiter`**: a sudden spike in PHI read calls from clinical-documentation-agent (e.g., >500 Epic API calls in 60 seconds vs. normal 80–120) triggers a `RATE_LIMIT` kill reason. This pattern matches the Week 6 psychiatric records incident — bulk PHI access outside authorization scope.
 
+#### Side-Channel Attack Mitigations
+
+PHI processed by CHP's clinical agents (drug-drug interaction comparisons, renal function thresholds, pediatric dosing calculations) is sensitive to timing oracle attacks — an adversary observing response latency differences could infer whether a patient's creatinine clearance falls above or below a contraindication threshold. CHP addresses this at each isolation layer:
+
+**CPU cache and timing attacks**:
+- Azure Container Instances provides Hyper-V per-container isolation (Layer 3), which is CHP's primary mitigation against cross-container cache-timing attacks (e.g., Spectre variant 1); ACI's Hyper-V boundary prevents direct shared-cache access between agent containers running on the same physical host
+- Hyper-threading / SMT is disabled at the ACI host level for Ring 0 and Ring 1 agent pools under CHP's enterprise Azure policy — accepted trade-off: ~15% CPU throughput reduction on clinical-safety-override-agent and eligibility-verification-agent, validated within the 12-second emergency authorization latency target
+- CPU pinning is not enforced at the ACI container level; CHP's threat model treats Hyper-V boundary as sufficient given FIPS 140-2 Level 2 HSM key protection
+
+**Shared memory**:
+- IPC namespace isolation (Layer 2) is enforced on all ACI containers — no shared memory segments, message queues, or semaphore sets are accessible across agent containers
+- No inter-agent shared memory paths exist in CHP's deployment; all inter-agent data exchange passes through IATP-signed messages, ensuring PHI never transits an uncontrolled memory region
+
+**Memory access pattern leakage**:
+- Drug-drug interaction lookups (Micromedex), renal/hepatic dosing comparisons, and pediatric weight-based dosing checks all use constant-time comparison primitives — a variable-time contraindication check could leak whether a specific drug combination is flagged, enabling inference of a patient's medication list
+- Ed25519 signing for JWT tokens (Epic FHIR API) and IATP attestations uses Azure Key Vault's cryptographic operations API, which executes inside the FIPS 140-2 Level 2 HSM; constant-time guarantees are provided by the HSM hardware, not application code
+- CHP security team reviews libsodium version and build flags quarterly as part of the seccomp profile review cycle
+
+**Known limitations and trade-offs**:
+- Rowhammer-class DRAM attacks cannot be mitigated at the OS or ACI layer; CHP relies on Azure's platform-level ECC memory and hypervisor isolation as the terminal defense — this residual risk is documented in CHP's HIPAA security risk analysis (§164.308(a)(1)(ii)(A))
+- ACI Hyper-V isolation does not protect against intra-VM timing attacks between processes within the same container; CHP mitigates this by enforcing single-agent-per-container at deployment time (one process per ACI instance)
+- Review cadence: CHP's security operations team reviews side-channel mitigations semi-annually and after any Azure platform CVE disclosure affecting ACI or Hyper-V
+
 #### Defense-in-Depth Composition
 
 ```
@@ -392,11 +415,36 @@ This section documents cryptographic operations, key management practices, and v
   - *Update*: On 90-day key rotation (new public key published) or ring change (trust score threshold crossed). DID document version incremented; prior versions retained for audit integrity.
   - *Deactivation*: On agent decommission or revocation. DID marked `deactivated` — not deleted. Historical signatures remain verifiable for the 7-year HIPAA retention period per §164.312(d).
 
+**Key Compromise and Recovery**
+
+A compromised Ed25519 private key in a clinical context carries immediate patient safety risk — an attacker holding the key could forge IATP attestations approving medically contraindicated treatments or issuing fraudulent PROVISIONAL EMERGENCY AUTHORIZATIONs. CHP's response targets containment within 5 minutes of detection:
+
+Detection mechanisms:
+- **Azure Key Vault anomaly alerts**: unexpected signing requests from processes outside the agent's managed identity, failed authorization attempts against the vault, or HSM audit log gaps that may indicate key extraction; alerts route to CHP security operations via Azure Monitor within 30 seconds
+- **Trust score anomaly**: a sudden spike in unusual delegation patterns (e.g., authorization-decision-agent requesting capabilities it has never used) correlated with signing activity triggers a security review before formal compromise is confirmed; this caught the Week 6 psychiatric records incident during the pilot
+- **External indicators**: Azure Security Center threat intelligence, Microsoft Defender for Cloud alerts on managed identity misuse, or direct notification from CHP's incident response team
+
+Immediate mitigation steps (target: <5 minutes from detection to containment):
+1. Revoke the key in Azure Key Vault — propagates to all agents holding a cached public key copy within <2 seconds via Key Vault event subscription
+2. Quarantine the affected agent via `QuarantineManager` — halts all signing operations; in-flight clinical authorization sagas are preserved for human review, not abandoned, to protect patient care continuity
+3. Issue a DID deactivation event in AgentMesh — all peer agents reject delegations from the deactivated DID on next IATP handshake (within one heartbeat cycle, ~5 seconds); clinical requests routed to human escalation queue automatically
+4. Provision a new Ed25519 keypair in Key Vault HSM, generate a new DID, and re-register the agent in AgentMesh under the incident change control process (dual approval required per CHP's HIPAA security incident procedure §164.308(a)(6))
+
+Propagation timeline and impact on dependent agents:
+- Key revocation: <2 seconds (Key Vault) → <5 seconds (IATP session invalidation across active connections) → <30 seconds (full cache invalidation across all 12 agents in both Azure regions)
+- IATP attestations signed by the compromised key: treated as invalid immediately after DID deactivation; CHP's 5-minute nonce TTL cache means at most 5 minutes of residual attestations could theoretically be replayed — mitigated by the simultaneous nonce cache flush on deactivation
+- Delegation chains: any chain passing through the compromised agent is invalid at the point of deactivation; downstream agents escalate to human queues rather than blocking care
+- Incident recorded in the Merkle audit trail with agent DID, timestamp, revocation reason, and approving human identities — retained for 7 years per HIPAA §164.308(a)(6)(ii)(D) for security incident documentation
+
 #### 4.4.3 Verification Mechanisms
 
 - **Peer identity verification before inter-agent calls**: Before accepting any IATP delegation, the receiving agent: (1) resolves the delegating agent's DID from AgentMesh registry, (2) checks status — rejects immediately if `deactivated`, (3) verifies the Ed25519 signature on the attestation payload, (4) confirms the effective trust score meets the minimum threshold for the requested capability. Total verification overhead: <1ms per call.
 - **Trust score threshold at connection time**: Agents with trust score below 600 cannot initiate delegations for clinical decisions (chemotherapy approval, emergency fast-path override). Agents scoring 600–699 may delegate only to human escalation queues, not to peer agents. Agents at 700+ may delegate within their approved capability set. If a delegating agent's score falls below threshold between delegation and execution, the executing agent re-checks at execution time and escalates rather than proceeding.
-- **Replay attack prevention**: All IATP attestations include a cryptographically random 128-bit nonce and an `issuedAt` timestamp (millisecond precision, NTP-synchronized). Receiving agents maintain a nonce cache (5-minute TTL) and reject any attestation with a previously seen nonce or timestamp outside a ±30-second window. This is critical in healthcare: a replayed PROVISIONAL EMERGENCY AUTHORIZATION could authorize a duplicate surgical procedure, causing patient harm and fraudulent billing.
+- **Replay attack prevention**: All IATP attestations include a cryptographically random 128-bit nonce and an `issuedAt` timestamp (millisecond precision, NTP-synchronized). Key details:
+  - **Nonce reuse detection**: each receiving agent maintains a per-sender-DID nonce cache (5-minute TTL); a duplicate nonce from the same sender DID is rejected immediately and logged to the Merkle audit trail as a potential replay attempt — in healthcare, a replayed PROVISIONAL EMERGENCY AUTHORIZATION could authorize a duplicate surgical procedure, causing patient harm and fraudulent billing
+  - **Nonce cache across distributed agents**: CHP's 12 agents run across 2 Azure regions; nonce caches are maintained per-instance (not shared via Redis) with an accept-on-first-seen policy — the 5-minute TTL is short enough that cross-region replay within the window is detected by the timestamp check
+  - **Maximum allowable clock drift**: ±30 seconds; attestations with `|sender_timestamp − receiver_timestamp| > 30s` are rejected even with a valid nonce; this window is deliberately wider than finance (±500ms) to accommodate async payer API response latency and Epic FHIR call queuing
+  - **Clock drift monitoring**: all ACI containers synchronize to Azure's NTP service (time.windows.com); Azure Monitor alerts CHP operations if NTP sync delta exceeds 5 seconds on any agent host — NTP drift above 25 seconds would approach the ±30-second rejection threshold and is treated as a P2 incident requiring immediate host remediation
 - **Delegation chain verification**: For sequential workflows (eligibility-verification-agent → clinical-documentation-agent → authorization-decision-agent → payer-submission-agent), each agent receives the full attestation chain from the origin. Before accepting a delegation, the agent walks the chain from origin to immediate delegator, verifying: each Ed25519 signature, monotonic capability narrowing at each hop, and that no DID in the chain is deactivated. Maximum chain depth: 4 hops (enforced by Agent OS policy).
 - **Failure behavior**: When verification fails (invalid signature, deactivated DID, expired nonce, trust below threshold), the agent: (1) denies the action immediately and logs the full chain details to the Merkle audit trail, (2) never silently fails or defaults to approval — patient safety requires explicit human escalation, (3) routes the original clinical request to the human escalation queue with failure reason attached, (4) if 3+ failures from the same agent occur within 10 minutes, alerts CHP security operations and initiates trust decay on the suspicious agent.
 
