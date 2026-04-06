@@ -15,7 +15,7 @@ _Disclaimer: This document presents a hypothetical use case intended to guide ar
 
 **Timeline**: 18 months — 3-month pilot, 12-month rollout, 3-month optimization
 
-**Deployment Scale**: 8 autonomous trading agents, 12,000 trades/day, 4 production environments (dev, staging, prod, disaster recovery) across 3 AWS regions
+**Deployment Scale**: 6 autonomous trading agents, 12,000 trades/day, 4 environments (dev, staging, prod, disaster recovery); production on bare-metal at Equinix NY4
 
 ---
 
@@ -23,7 +23,7 @@ _Disclaimer: This document presents a hypothetical use case intended to guide ar
 
 Merchantlife Trading Group, a mid-sized proprietary trading firm managing $3.2B in assets, faced a critical challenge: manual compliance review created 45-90 second delays per trade, eroding alpha in momentum strategies where every second costs 12 basis points. Following a $2.8M SEC fine for inadequate pre-trade controls in 2023, the firm needed to deploy autonomous trading agents without risking market manipulation violations that carry civil penalties up to $1M per incident and potential criminal prosecution.
 
-MTG deployed the Agent Governance Toolkit to enable 8 autonomous trading agents with Ed25519 cryptographic identity, sub-millisecond policy enforcement, and SEC Rule 17a-4 compliant audit trails. Results: 97% faster compliance (2.3 seconds vs 45-90 seconds), 69% increase in daily capacity (13,500 trades vs 8,000), zero regulatory violations across 18 months, and 99.97% uptime with just 0.3% governance overhead in total execution latency.
+MTG deployed the Agent Governance Toolkit to enable 6 autonomous trading agents with Ed25519 cryptographic identity, sub-millisecond policy enforcement, and SEC Rule 17a-4 compliant audit trails. Results: 97% faster compliance (2.3 seconds vs 45-90 seconds), 69% increase in daily capacity (13,500 trades vs 8,000), zero regulatory violations across 18 months, and 99.97% uptime with just 0.3% governance overhead in total execution latency.
 
 ---
 
@@ -203,7 +203,7 @@ After these incidents plus a position limit breach caught by the prime broker, t
 LATENCY BUDGET (Market Signal → Order Acknowledgment):
   Market data capture:          180μs (p50)
   AGT policy evaluation:         45μs (p50)
-  Risk/compliance review:      2,000μs (parallel, p95)
+  Risk/compliance review:      2,000μs (parallel, p50)
   FIX order submission:          420μs (network)
   Exchange processing:         1,200μs (matching engine)
   ─────────────────────────────────────────
@@ -217,7 +217,7 @@ AGT layers governance middleware between trading models and FIX protocol OMS. YA
 
 AgentMesh provides Ed25519 identity per agent (AWS KMS FIPS 140-2 Level 3 HSM), mutual TLS 1.3 for inter-agent communication, and dynamic trust scores based on execution quality, compliance history, and Sharpe ratios. Three exchange rejects decay trust from 780 to 620, demoting Ring 1 to Ring 2 with mandatory human approval.
 
-Agent Runtime executes agents in isolated AWS Fargate containers (Ring 1: 8 vCPU/16GB; Ring 2: 4 vCPU/8GB). Agents cannot communicate directly with exchanges—all market access flows through AGT policy gateway. Kill switch terminates containers in <30ms on CPU overruns, abnormal order patterns (>1,000/sec), or excessive rejects (>50/hour).
+Agent Runtime executes agents in isolated Linux containers on bare-metal servers at Equinix NY4 (Ring 1: 8 vCPU/16GB; Ring 2: 4 vCPU/8GB). Agents cannot communicate directly with exchanges—all market access flows through AGT policy gateway. Kill switch terminates containers in <30ms on CPU overruns, abnormal order patterns (>1,000/sec), or excessive rejects (>50/hour).
 
 Agent Compliance generates Merkle-chained append-only audit trails (SEC Rule 17a-4): agent DID, NTP microsecond timestamps, order details, policy decisions, risk metrics, compliance checks. Logs stream to AWS S3 Object Lock (WORM, 7-year retention). Hourly cryptographic hash chains enable tamper verification by auditors.
 
@@ -290,6 +290,29 @@ Each agent's order state, signal cache, and session context are scoped to a per-
 - **`RingBreachDetector`**: WARNING (1-ring gap), HIGH (2-ring gap, e.g., options-arbitrage-agent attempting Ring 1 order submission directly), CRITICAL (3-ring gap). HIGH and CRITICAL trigger immediate kill with no deferral window
 - **`KillSwitch`**: <30ms termination; all pending orders for the killed agent are cancelled via FIX `OrderCancelRequest` (MsgType=F) to exchanges within the same 30ms window; saga compensation notifies risk-management-agent for position reconciliation
 - No deferral exception exists (contrast with healthcare's 90-second emergency window) — a compromised trading agent submitting unauthorized orders must be stopped faster than any exchange acknowledgment cycle
+
+#### Side-Channel Attack Mitigations
+
+High-frequency trading is acutely sensitive to timing side-channels: an adversary with co-located servers at Equinix NY4 could observe compliance-monitoring-agent response latency to infer whether a specific order pattern matched a layering rule — effectively reading MTG's surveillance logic without a software exploit. With no Layer 3 hypervisor deployed, OS-kernel mitigations carry extra weight.
+
+**CPU cache and timing attacks**:
+- SMT / hyper-threading is disabled on all Ring 1 agent bare-metal hosts at Equinix NY4 — this was initially adopted for deterministic latency (SMT causes cache contention that inflates p99 policy evaluation from 80μs to 140μs) and simultaneously eliminates cross-thread L1/L2 cache-timing attack vectors between agent processes
+- CPU pinning is enforced for all six agents: each agent process is pinned to a dedicated physical core set via `taskset` at container startup, preventing cache-sharing with sibling containers on the same host; this is MTG's primary mitigation for Spectre variant 1 in the absence of gVisor
+- Ring 2 (options-arbitrage-agent) runs on a physically separate host from Ring 1 agents — cross-ring cache-timing attacks are not possible because the agents never share a physical CPU
+
+**Shared memory**:
+- IPC namespace isolation (Layer 2) enforced on all containers — no shared memory segments, message queues, or semaphore sets across agent containers
+- Market data normalization layer delivers tick data via a kernel multicast socket within each agent's own network namespace; no shared-memory ring buffer between agents, which would otherwise be the primary performance optimization and the primary side-channel risk in trading systems
+
+**Memory access pattern leakage**:
+- Compliance-monitoring-agent's layering detection algorithm (cancel-to-fill ratio, order pattern graph analysis) uses constant-time comparisons for pattern matching thresholds — variable-time comparison would leak whether an order pattern crossed the 80% cancel-to-fill threshold, enabling front-running of the surveillance logic
+- Ed25519 signing for FIX order authentication uses AWS KMS API (FIPS 140-2 Level 3 HSM) — constant-time guarantees are provided by the HSM hardware; the ~400μs KMS API call overhead is already accounted for in the 6.8ms trade execution latency budget
+- All cryptographic comparisons in IATP verification (nonce matching, signature verification) use libsodium `crypto_verify_*` constant-time functions; MTG security team verifies the libsodium version and `--disable-asm` flag status quarterly
+
+**Known limitations and trade-offs**:
+- No Layer 3 hypervisor is deployed — gVisor's ~10μs/syscall overhead is incompatible with the <50μs feed latency requirement; MTG accepts the residual risk of kernel-level microarchitectural attacks (Spectre, Meltdown) at the OS layer, documented in the security exception register and reviewed annually
+- CPU pinning and SMT disabling together reduce peak throughput by ~20% on Ring 1 hosts; this is measured and accepted: at 1,000 orders/min peak, the remaining headroom is sufficient before the kill switch rate limit triggers
+- Rowhammer risk is mitigated by ECC DRAM on all Equinix NY4 bare-metal hosts (MTG-owned hardware); ECC configuration verified at quarterly hardware maintenance windows
 
 #### Defense-in-Depth Composition
 
@@ -386,11 +409,36 @@ This section documents cryptographic operations, key management practices, and v
   - *Update*: On 90-day key rotation (new public key) or trust-driven ring change (e.g., three exchange rejects demote Ring 1 to Ring 2, requiring updated DID document to reflect reduced authority). Version incremented; prior versions retained.
   - *Deactivation*: On agent decommission or revocation. DID marked `deactivated` — not deleted. Historical signatures remain verifiable for the 7-year SEC Rule 17a-4 retention period.
 
+**Key Compromise and Recovery**
+
+A compromised Ed25519 private key in a trading context carries immediate market integrity risk — an attacker holding the key could forge compliance-monitoring-agent APPROVE attestations for manipulative order patterns, or forge execution-agent FIX signatures to submit unauthorized orders to exchanges. MTG's response targets containment within 5 minutes of detection:
+
+Detection mechanisms:
+- **AWS CloudTrail + KMS anomaly alerts**: unexpected CMK usage outside the agent's IAM role, KMS API calls from unrecognized IPs or at unusual hours, or AWS GuardDuty alerts on managed identity misuse; routed to MTG compliance operations via CloudWatch alarm within 60 seconds
+- **Trust score anomaly**: a sudden divergence between an agent's signing volume and its authorized order rate (e.g., compliance-monitoring-agent signing 10x more attestations than trades received) may indicate key misuse before formal compromise is confirmed
+- **Exchange-side indicators**: FIX reject storms or unusual order acknowledgment patterns from exchanges that don't match known order flow may indicate forged FIX messages signed with a compromised execution-agent key
+
+Immediate mitigation steps (target: <5 minutes from detection to containment):
+1. Disable the AWS KMS CMK for the affected agent — propagates to all agents holding a cached public key within <1 second via KMS event; all signing operations cease immediately
+2. Activate kill switch on the affected agent — pending FIX orders cancelled via `OrderCancelRequest` (MsgType=F) to all exchanges within the same <30ms window to prevent unauthorized position accumulation
+3. Issue a DID deactivation event in AgentMesh — all peer agents reject delegations from the deactivated DID within one heartbeat cycle (~5 seconds); execution-agent blocks any FIX message construction using an attestation from the deactivated DID
+4. Provision a new Ed25519 keypair in AWS KMS HSM, generate a new DID, and re-register the agent — requires dual approval from MTG compliance officer and head of technology under SEC Rule 17a-4 change control; new FIX session certificates negotiated with exchanges at next market session reset
+
+Propagation timeline and impact on dependent agents:
+- Key revocation: <1 second (KMS CMK disable) → <5 seconds (IATP session invalidation) → <30 seconds (nonce cache flush across all six agents at Equinix NY4 — single-site deployment, no cross-region propagation delay)
+- Pending orders: all FIX orders associated with the compromised agent are cancelled within the 30ms kill switch window; risk-management-agent reconciles resulting position changes against VaR limits and alerts human traders if exposure exceeds stop-loss thresholds
+- IATP attestations signed by the compromised key: invalid immediately after DID deactivation; 60-second nonce TTL cache is flushed on deactivation to eliminate residual replay window
+- Incident recorded in the Merkle audit trail with microsecond timestamps and approving human identities — retained for 7 years per SEC Rule 17a-4; MTG compliance team evaluates whether SEC/FINRA incident reporting is required under Rule 17a-4(f) and FINRA Rule 3110
+
 #### 4.4.3 Verification Mechanisms
 
 - **Peer identity verification before inter-agent calls**: Before accepting any IATP delegation in the trading workflow, the receiving agent: (1) resolves the delegating agent's DID from AgentMesh registry, (2) checks status — rejects immediately if `deactivated`, (3) verifies the Ed25519 signature on the attestation payload, (4) confirms the effective trust score meets the minimum threshold for the requested capability. Total verification overhead: <1ms — within the 6.8ms end-to-end trade latency budget.
 - **Trust score threshold at connection time**: Agents with trust score below 600 cannot initiate trade delegations. Agents scoring 600–699 (Ring 2) require mandatory human approval for all orders before FIX message construction. Agents at 700+ (Ring 1) may execute within autonomous limits. If a delegating agent's score falls below threshold mid-workflow (e.g., rapid exchange rejects during high volatility), the execution-agent re-checks at submission time and withholds the FIX order pending human review.
-- **Replay attack prevention**: All IATP attestations include a cryptographically random 128-bit nonce and an `issuedAt` microsecond timestamp (NTP-synchronized to <1μs precision). Receiving agents maintain a nonce cache (60-second TTL — aligned with momentum signal alpha decay window) and reject any attestation with a previously seen nonce or timestamp outside a ±500ms window. Critical in trading: a replayed trade delegation could submit a duplicate order, creating unintended position accumulation, wash trading, or layering exposure under SEC §9(a) and FINRA Rule 2010.
+- **Replay attack prevention**: All IATP attestations include a cryptographically random 128-bit nonce and an `issuedAt` microsecond timestamp (NTP-synchronized to <1μs precision). Key details:
+  - **Nonce reuse detection**: each receiving agent maintains a per-sender-DID nonce cache (60-second TTL — aligned with momentum signal alpha decay window); a duplicate nonce from the same sender DID is rejected immediately and logged to the Merkle audit trail with microsecond timestamp as a potential replay attempt; critical in trading: a replayed risk-management-agent APPROVE could submit a duplicate order at a price 50–200bp stale in a volatile market, constituting wash trading or unintended position accumulation under SEC §9(a) and FINRA Rule 2010
+  - **Nonce cache across distributed agents**: all six agents run on bare-metal at Equinix NY4 (single-site, no multi-region distribution); nonce caches are maintained per-agent-process with no cross-agent synchronization required — single-site co-location eliminates the distributed cache consistency problem that requires Redis in multi-region deployments
+  - **Maximum allowable clock drift**: ±500ms — the tightest window across all AGT deployments, calibrated to the 180μs p50 market data timestamp resolution; a 500ms-stale order approval is already outside the momentum signal alpha decay window (60 seconds) but within the exchange order validity window, making it a meaningful replay risk
+  - **Clock drift monitoring**: all Equinix NY4 hosts synchronize to a GPS-disciplined NTP stratum-1 source (co-located in NY4 for <1μs precision); MTG network operations alerts if NTP sync delta exceeds 50ms on any agent host — a 50ms alert threshold provides a 450ms buffer before approaching the ±500ms rejection boundary, preventing false-positive rejections during normal market hours
 - **Delegation chain verification**: For the parallel approval workflow (momentum-trading-agent → risk-management-agent + compliance-monitoring-agent → execution-agent), the execution-agent receives the full attestation chain before constructing any FIX message. It verifies: each Ed25519 signature, APPROVE decisions from both risk and compliance agents (a single DENY from either blocks execution), monotonic capability narrowing at each hop, and no deactivated DID in the chain. Maximum chain depth: 4 hops (Agent OS policy). Missing or conflicting approval signals result in order rejection, not a default-approve — regulatory exposure from an unauthorized trade far outweighs a missed signal.
 - **Failure behavior**: When verification fails (invalid signature, deactivated DID, expired nonce, trust below threshold), the agent: (1) denies the action immediately and logs full chain details with microsecond timestamp to the Merkle audit trail (satisfying SEC Rule 17a-4 documentation requirements), (2) issues FIX OrderCancelRequest for any related orders already submitted to exchanges, (3) routes the trade opportunity to the human trader queue with failure reason, (4) if 3+ failures from the same agent occur within 5 minutes, triggers kill switch evaluation and alerts MTG compliance operations.
 
@@ -424,7 +472,7 @@ Reduced latency enabled three new strategies (news sentiment momentum, ETF arbit
 | FIX order latency (end-to-end) | <10ms | 6.8ms | Exceeded |
 | Order reject rate | <0.5% | 0.08% | Exceeded |
 
-Governance overhead: 0.045ms per action, representing 0.3% of end-to-end latency (6.8ms). System scaled across 3 AWS regions without degradation. Peak load: 18,300 trades/day during January 2025 meme stock volatility (1,200 trades/minute), p99 latency remained <0.12ms. Fargate auto-scaling: Ring 1 agents scaled 6→18 instances during market open/close volatility. Circuit breaker prevented cascading failure during February 2025 NASDAQ 8-minute feed latency spike—agents switched to backup NYSE feed rather than trading on stale data.
+Governance overhead: 0.045ms per action, representing 0.3% of end-to-end latency (6.8ms). Peak load: 18,300 trades/day during January 2025 meme stock volatility (1,200 trades/minute), p99 latency remained <0.12ms; pre-provisioned bare-metal capacity at Equinix NY4 absorbed the surge without degradation. Circuit breaker prevented cascading failure during February 2025 NASDAQ 8-minute feed latency spike—agents switched to backup NYSE feed rather than trading on stale data.
 
 ### 5.3 Compliance and Security Posture
 
